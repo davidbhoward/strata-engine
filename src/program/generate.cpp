@@ -9700,6 +9700,7 @@ int main(int argc, char** argv) {
         // STRATA_PIPE_MTP: group gi's window (slot gi's rows) has left the last stage.  Row j's pick is a decided token when
         // every row up to j was one: the kept rows, then each proposal the row before it picked.
         int64_t pd_windows = 0, pd_rows = 0, pd_proposed = 0, pd_accepted = 0;
+        double pd_draft_ms = 0, pd_pool0 = 0;   // the host's time in the slot drafts; the stages' pool time when timing began
         auto pdraft_done = [&](int gi, strata::core::Verifier& vk) -> bool {
             PGroup& G = pg[(size_t) gi];
             BSlot& sl = bs[(size_t) gi];
@@ -9753,12 +9754,14 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) gi]->device());
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
             int nd = 0;
+            const Clock::time_point td0 = Clock::now();
             if (cudaMemcpyAsync(slot_mtp_rows[(size_t) gi].get(), vk.final_R_all(), (size_t) A * stride * sizeof(float),
                                 cudaMemcpyDeviceToDevice, slot_mtp[(size_t) gi]->stream()) != cudaSuccess ||
                 !slot_mtp[(size_t) gi]->draft(A, outb, G.pos[0], A - 1, sl.draft.data(), err, nullptr, 0.0f, &nd)) {
                 std::printf("ERR batch MTP slot %d: %s\n", gi, err.c_str());
                 return false;
             }
+            pd_draft_ms += std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
             sl.n_draft = nd;
             sl.draft_ready = true;
             return true;
@@ -9770,6 +9773,8 @@ int main(int argc, char** argv) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
+                pd_pool0 = 0;
+                for (int k = 0; k < n_pipe; ++k) pd_pool0 += stage_verifier(k).ms_pool;
             }
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
@@ -9903,6 +9908,14 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < n_pipe; ++k) {
                     const std::string pr = stage_verifier(k).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
+                }
+                {
+                    double pool = -pd_pool0;
+                    for (int k = 0; k < n_pipe; ++k) pool += stage_verifier(k).ms_pool;
+                    std::fprintf(stderr, "strata batch (pipelined): %.2f ms of wall time per group-step; on the host, CPU "
+                                         "experts %.2f ms (all stages) and slot drafts %.2f ms per group-step\n",
+                                 wall / w, pool / w, pd_draft_ms / w);
+                    pd_draft_ms = 0;
                 }
                 if (pdraft && pd_windows > 0)
                     std::fprintf(stderr, "strata batch (pipelined): MTP proposals accepted %lld of %lld (%.1f%%), %.2f rows "
