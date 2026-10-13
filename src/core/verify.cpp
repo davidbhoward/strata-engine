@@ -3028,6 +3028,46 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 
+bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                                 const int* keep, std::string& err) {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    if (!stage_batch(rows, S, hbase, tokens, pos, err)) return false;
+    // the prefix each slot keeps is known before the window runs (its rows up to there are tokens already decided),
+    // so the commit still needs no host decision and goes right behind the window
+    const int64_t CB = 2 + max_t_;
+    for (int t = 0; t < S;) {
+        const int first = t;
+        while (t < S && rows[t] == rows[first]) ++t;
+        const int n = keep[rows[first]];
+        if (n < 1 || n > t - first) { err = "verify: accepted prefix is outside its slot group"; return false; }
+        int32_t* c = h_commitb_ + (size_t) rows[first] * CB;
+        c[0] = n;
+        c[1] = n - 1;
+        for (int j = 0; j < max_t_; ++j) c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, hbase)], cs_);
+    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, hbase)], cs_);
+    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (ple_stage())   // the host's side of the commit (the hash's last two tokens): the kept rows only
+        for (int t = 0; t < S;) {
+            const int first = t;
+            while (t < S && rows[t] == rows[first]) ++t;
+            SessionState& sx = *slots_[(size_t) rows[first]];
+            for (int u = first; u < first + keep[rows[first]]; ++u) {
+                sx.ple_prev[0] = sx.ple_prev[1];
+                sx.ple_prev[1] = tokens[u];
+            }
+        }
+    b_running_ = true;
+    b_k_ = 0;
+    b_steps_ = le_ - lb_;
+    b_last_ = Clock::now();
+    return true;
+}
+
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (!b_running_) return 1;
     const OnDevice on_device(device_);
