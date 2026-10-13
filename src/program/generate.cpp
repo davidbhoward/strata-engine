@@ -9672,6 +9672,10 @@ int main(int argc, char** argv) {
         const int PR = std::min(strata::kernels::kVerifyMaxT / std::max(o.batch_groups, 1), o.spec);
         const bool pdraft = piped && batch_mtp && pipe_mtp > 0 && o.batch == o.batch_groups && PR >= 2;
         bool pipe_refeed = false;
+        // the proposals a window carries: the chain stops at the first one under this probability (--spec-min-p, as the
+        // solo windows; STRATA_PIPE_MTP_MIN_P overrides it, 0 = every proposal)
+        float pipe_min_p = (float) o.spec_min_p;
+        { const char* mp = std::getenv("STRATA_PIPE_MTP_MIN_P"); if (mp != nullptr && mp[0] != ' ') pipe_min_p = (float) std::atof(mp); }
         { const char* pr = std::getenv("STRATA_PIPE_MTP_REFEED"); pipe_refeed = pr != nullptr && pr[0] != '\0' && pr[0] != '0'; }
         if (pdraft)
             std::fprintf(stderr, "strata generate: STRATA_PIPE_MTP=%d: the pipelined groups verify up to %d proposal%s per "
@@ -9774,14 +9778,16 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) gi]->device());
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
             int nd = 0;
+            float dprob[strata::kernels::kVerifyMaxT] = {};
             const Clock::time_point td0 = Clock::now();
             if (cudaMemcpyAsync(slot_mtp_rows[(size_t) gi].get(), vk.final_R_all(), (size_t) A * stride * sizeof(float),
                                 cudaMemcpyDeviceToDevice, slot_mtp[(size_t) gi]->stream()) != cudaSuccess ||
-                !slot_mtp[(size_t) gi]->draft(A, outb, G.pos[0], A - 1, sl.draft.data(), err, nullptr, 0.0f, &nd)) {
+                !slot_mtp[(size_t) gi]->draft(A, outb, G.pos[0], A - 1, sl.draft.data(), err, dprob, pipe_min_p, &nd)) {
                 std::printf("ERR batch MTP slot %d: %s\n", gi, err.c_str());
                 return false;
             }
             pd_draft_ms += std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
+            if (pipe_min_p > 0.0f && nd > 0 && dprob[0] < pipe_min_p) nd = 0;   // an unsure first proposal is not worth its row
             sl.n_draft = nd;
             sl.draft_ready = true;
             return true;
