@@ -9675,7 +9675,7 @@ int main(int argc, char** argv) {
         // the proposals a window carries: the chain stops at the first one under this probability (--spec-min-p, as the
         // solo windows; STRATA_PIPE_MTP_MIN_P overrides it, 0 = every proposal)
         float pipe_min_p = (float) o.spec_min_p;
-        { const char* mp = std::getenv("STRATA_PIPE_MTP_MIN_P"); if (mp != nullptr && mp[0] != ' ') pipe_min_p = (float) std::atof(mp); }
+        { const char* mp = std::getenv("STRATA_PIPE_MTP_MIN_P"); if (mp != nullptr && mp[0] != '\0') pipe_min_p = (float) std::atof(mp); }
         { const char* pr = std::getenv("STRATA_PIPE_MTP_REFEED"); pipe_refeed = pr != nullptr && pr[0] != '\0' && pr[0] != '0'; }
         if (pdraft)
             std::fprintf(stderr, "strata generate: STRATA_PIPE_MTP=%d: the pipelined groups verify up to %d proposal%s per "
