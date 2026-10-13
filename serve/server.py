@@ -1652,9 +1652,12 @@ class StrataEngine:
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
-        if gs:
-            # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
-            # free for a next turn.  A group's window spans its slots up to its last busy one, so first fill a hole
+        if gs > 1:
+            # pipelined groups of several slots: a group's window writes a pad row into its idle slots, so the engine
+            # keeps none of them as a conversation cache and nothing is worth keeping free for a next turn.  (Groups
+            # of ONE slot have no pad rows: an idle slot keeps its conversation, and the choice below - the slot that
+            # holds the start of this prompt, else one that holds nothing - leaves the other conversation where its
+            # next turn finds it; #1604.)  A group's window spans its slots up to its last busy one, so first fill a hole
             # below a busy slot of the same group (it costs no extra row), then follow the spreading order
             # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
             def fills_hole(b):
