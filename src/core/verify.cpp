@@ -492,6 +492,12 @@ Verifier::~Verifier() {
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
+    for (auto& kv : commit_rm_)
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    for (size_t i = 1; i < csets_.size(); ++i)
+        if (csets_[i].base) cudaFree(csets_[i].base);
+    if (commitr_) cudaFree(commitr_);
+    if (h_commitr_) cudaFreeHost(h_commitr_);
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
@@ -2572,6 +2578,12 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     arena_b_ = d;
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
+    // commit_row_launch's records, one per (slot, window row)
+    if (!mapped((size_t) (S * max_t_ * 16 + 16), (void**) &h_commitr_, (void**) &m_commitr_) ||
+        cudaMalloc((void**) &commitr_, (size_t) (S * max_t_ * 16 + 16)) != cudaSuccess) {
+        err = "verify: the batch row-commit staging failed";
+        return false;
+    }
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
@@ -3028,11 +3040,140 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 
+bool Verifier::use_cset(int i, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers(), T = (uint64_t) max_t_;
+    const uint64_t C = (uint64_t) g.ssm_conv_channels, HV = (uint64_t) g.ssm_v_heads, ID = (uint64_t) g.idx_key_dim;
+    const uint64_t HS = (uint64_t) NG_HIST * NG_HC_DIM;
+    if (csets_.empty()) csets_.push_back(CommitSet{nullptr, qkv_L_, h_L_, gate_L_, beta_L_, idx_raw_L_, hist_snap_});
+    if (i < 0) { err = "verify: commit buffer set out of range"; return false; }
+    if ((size_t) i >= csets_.size()) csets_.resize((size_t) i + 1);
+    CommitSet& c = csets_[(size_t) i];
+    if (c.qkv == nullptr) {
+        const uint64_t n = 2 * nG * T * C + 2 * nG * T * HV + nQ * T * ID + T * HS;
+        if (cudaMalloc(&c.base, n * sizeof(float)) != cudaSuccess) { err = "verify: a window's commit buffers do not fit"; return false; }
+        float* f = (float*) c.base;
+        c.qkv = f; f += nG * T * C;
+        c.h = f; f += nG * T * C;
+        c.gate = f; f += nG * T * HV;
+        c.beta = f; f += nG * T * HV;
+        c.idx_raw = f; f += nQ * T * ID;
+        c.hist = f;
+    }
+    qkv_L_ = c.qkv; h_L_ = c.h; gate_L_ = c.gate; beta_L_ = c.beta; idx_raw_L_ = c.idx_raw; hist_snap_ = c.hist;
+    return true;
+}
+
+bool Verifier::capture_commit_row(const int* rows, int S, int hbase, int j, std::string& err) {
+    std::vector<int> key = bkey(rows, S, hbase);
+    key.push_back(j);
+    cudaGraphExec_t& cex = commit_rm_[key];
+    if (cex != nullptr) return true;
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    SessionState& sx = *slots_[(size_t) rows[0]];
+    int32_t* const rec = commitr_ + ((size_t) rows[0] * MT + j) * 4;   // [1, j, pos, -]
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin batch row commit capture failed";
+        return false;
+    }
+    bool ok = true;
+    try {
+        copy_i32_from_mapped(rec, m_commitr_ + ((size_t) rows[0] * MT + j) * 4, 4, cs_);
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        for (int64_t l = lb_; l < le_ && ok; ++l) {
+            const LayerView v(*wt_, l);
+            if (!is_qsa_layer(g, l)) {
+                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
+                if (!wnm) { ok = false; break; }
+                float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) j * C, (int) C, rec, cs_);
+                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) j * C, (int) C,
+                                    gate_L_ + (size_t) gdn_index * MT * HV + (size_t) j * HV,
+                                    beta_L_ + (size_t) gdn_index * MT * HV + (size_t) j * HV,
+                                    z_ + (size_t) j * ZV, (const float*) wnm->data, EPS,
+                                    y_dummy_ + (size_t) j * ZV, (int) g.ssm_k_heads, (int) HV, 1, rec, cs_, 0);
+                ++gdn_index;
+            } else {
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; break; }
+                const QsaState& st = sx.qsa_states[qsa_index];
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + j) * ID, rec + 2, 0,
+                                          (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                ++qsa_index;
+            }
+        }
+        if (ok && ss_->ple.ready() && ple_stage()) copy_indexed(sx.ple_hist, hist_snap_, HS, rec + 1, HS, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify batch row commit: ") + e.what();
+        ok = false;
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok || ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        if (ok) err = std::string("verify: batch row commit capture: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    const cudaError_t ie = cudaGraphInstantiate(&cex, graph, 0);
+    cudaGraphDestroy(graph);
+    if (ie != cudaSuccess) { err = std::string("verify: batch row commit instantiate: ") + cudaGetErrorString(ie); return false; }
+    return true;
+}
+
+bool Verifier::commit_row_launch(const int* rows, int S, int hbase, int cset, int j, std::string& err) {
+    const OnDevice on_device(device_);
+    if (cset < 1 || j < 1 || j >= S || j >= last_t_ + 8) { err = "verify: commit_row_launch arguments out of range"; return false; }
+    std::vector<int> key = bkey(rows, S, hbase);
+    key.push_back(j);
+    const auto it = commit_rm_.find(key);
+    if (it == commit_rm_.end() || it->second == nullptr) { err = "verify: commit_row_launch without its window"; return false; }
+    int32_t* r = h_commitr_ + ((size_t) rows[0] * max_t_ + j) * 4;
+    r[0] = 1;
+    r[1] = j;
+    r[2] = (int32_t) row_pos_[(size_t) cset % 8][j];
+    r[3] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const cudaError_t le = cudaGraphLaunch(it->second, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: batch row commit launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (ple_stage()) {
+        SessionState& sx = *slots_[(size_t) rows[0]];
+        sx.ple_prev[0] = sx.ple_prev[1];
+        sx.ple_prev[1] = row_tok_[(size_t) cset % 8][j];
+    }
+    return true;
+}
+
 bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                                 const int* keep, std::string& err) {
+                                 const int* keep, std::string& err, int cset) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    if (!stage_batch(rows, S, hbase, tokens, pos, err)) return false;
+    if (cset > 0) {
+        // the window's own commit buffers: its graphs are captured with the members pointing there (the key's hbase
+        // tells the windows of different sets apart), and so are the graphs that keep one more row later
+        for (int t = 1; t < S; ++t)
+            if (rows[t] != rows[0]) { err = "verify: a window with its own commit buffers holds one slot"; return false; }
+        if (!use_cset(cset, err)) return false;
+        const bool ok = stage_batch(rows, S, hbase, tokens, pos, err);
+        std::string e2;
+        bool okr = ok;
+        for (int j = 1; okr && j < S; ++j) okr = capture_commit_row(rows, S, hbase, j, e2);
+        std::string e3;
+        (void) use_cset(0, e3);
+        if (!ok) return false;
+        if (!okr) { err = e2; return false; }
+        for (int t = 0; t < S && t < 8; ++t) { row_pos_[(size_t) cset % 8][t] = pos[t]; row_tok_[(size_t) cset % 8][t] = tokens[t]; }
+    } else if (!stage_batch(rows, S, hbase, tokens, pos, err)) return false;
     // the prefix each slot keeps is known before the window runs (its rows up to there are tokens already decided),
     // so the commit still needs no host decision and goes right behind the window
     const int64_t CB = 2 + max_t_;

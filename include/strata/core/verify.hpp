@@ -219,7 +219,14 @@ public:
     /// entry per slot (indexed by slot ID), each in 1..that slot's group length.  The rows past a slot's prefix are
     /// proposals: they run, and nothing of them enters the slot's state.
     bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, const int* keep,
-                           std::string& err);
+                           std::string& err, int cset = 0);
+    /// A proposal of a batch_launch_rows window kept after all: row `j` (>= the slot's kept prefix; each row once, in
+    /// order) of the one-slot window (rows, S, hbase) launched with `cset` > 0 enters the slot's state, as if the
+    /// window's commit had kept it.  Queued on the stage's stream, no wait and no host decision later: the next window
+    /// of that slot runs behind it.  This stage only (the caller launches it on every stage).  `cset` > 0 gives the
+    /// window its own copy of the buffers a commit reads, so another slot's window on this stage in between does not
+    /// overwrite them.
+    bool commit_row_launch(const int* rows, int S, int hbase, int cset, int j, std::string& err);
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
@@ -331,6 +338,17 @@ private:
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    std::map<std::vector<int>, cudaGraphExec_t> commit_rm_;             ///< commit_row_launch: layout + the row
+    /// the buffers a commit reads from its window (set 0: the arena's): batch_launch_rows captures a window's graphs
+    /// with the members pointing into its set
+    struct CommitSet { void* base = nullptr; float *qkv = nullptr, *h = nullptr, *gate = nullptr, *beta = nullptr, *idx_raw = nullptr, *hist = nullptr; };
+    std::vector<CommitSet> csets_;
+    bool use_cset(int i, std::string& err);
+    bool capture_commit_row(const int* rows, int S, int hbase, int j, std::string& err);
+    int32_t* h_commitr_ = nullptr; int32_t* m_commitr_ = nullptr;   // per (slot, row) [1, row, pos, -]: commit_row_launch
+    int32_t* commitr_ = nullptr;
+    int64_t row_pos_[8][8] = {};   ///< per commit buffer set: the positions and tokens of its last window's rows
+    int32_t row_tok_[8][8] = {};
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts

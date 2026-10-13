@@ -9671,6 +9671,8 @@ int main(int argc, char** argv) {
         // out between the groups; a slot drafter reads at most --spec rows)
         const int PR = std::min(strata::kernels::kVerifyMaxT / std::max(o.batch_groups, 1), o.spec);
         const bool pdraft = piped && batch_mtp && pipe_mtp > 0 && o.batch == o.batch_groups && PR >= 2;
+        bool pipe_refeed = false;
+        { const char* pr = std::getenv("STRATA_PIPE_MTP_REFEED"); pipe_refeed = pr != nullptr && pr[0] != '\0' && pr[0] != '0'; }
         if (pdraft)
             std::fprintf(stderr, "strata generate: STRATA_PIPE_MTP=%d: the pipelined groups verify up to %d proposal%s per "
                                  "slot (windows of up to %d rows)\n", pipe_mtp, pipe_mtp, pipe_mtp == 1 ? "" : "s", PR);
@@ -9721,11 +9723,11 @@ int main(int argc, char** argv) {
                 nan_flush = true;
                 return true;
             }
-            for (int j = 0; j < K; ++j) sl.ids.push_back(G.tok[j]);   // what its sessions hold now
             ++pd_windows;
             pd_rows += G.S;
             pd_proposed += G.S - K;
             int A = K;   // the rows whose pick is decided
+            bool ended = false;
             for (int j = K - 1; j < G.S; ++j) {
                 const int32_t y = outb[j];
                 std::printf("BT %d %d\n", gi, (int) y);
@@ -9739,16 +9741,34 @@ int main(int argc, char** argv) {
                     std::printf("BDONE %d %lld %s %.1f\n", gi, (long long) sl.produced, fin, ms);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
-                    return true;
+                    ended = true;
+                    A = j + 1;
+                    break;
                 }
                 A = j + 1;
                 if (j + 1 >= G.S || G.tok[j + 1] != y) break;   // the next row is not this pick: its proposal missed
                 ++pd_accepted;
             }
-            sl.x = outb[K - 1];
-            sl.p = G.pos[0] + K;
-            sl.n_known = A - K;
-            for (int j = 0; j < sl.n_known; ++j) sl.known[(size_t) j] = outb[K + j];
+            // the accepted proposals enter the slot's state on every stage, behind whatever runs there now and before
+            // the slot's next window (STRATA_PIPE_MTP_REFEED=1: they are fed again by that window instead)
+            int held = K;   // the window's rows its sessions hold
+            if (!pipe_refeed) {
+                int prow[strata::kernels::kVerifyMaxT] = {};
+                for (int t = 0; t < G.S; ++t) prow[t] = gi;
+                for (int j = K; j < A; ++j)
+                    for (int k = 0; k < n_pipe; ++k)
+                        if (!stage_verifier(k).commit_row_launch(prow, G.S, gi * PR, gi + 1, j, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return false;
+                        }
+                held = A;
+            }
+            for (int j = 0; j < held; ++j) sl.ids.push_back(G.tok[j]);
+            if (ended) return true;
+            sl.x = outb[held - 1];
+            sl.p = G.pos[0] + held;
+            sl.n_known = A - held;
+            for (int j = 0; j < sl.n_known; ++j) sl.known[(size_t) j] = outb[held + j];
             // the slot's next proposals, from the decided rows' residuals (the last stage's, on the drafter's GPU): read
             // before the last stage starts its next window, which writes those rows
             const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) gi]->device());
@@ -9889,7 +9909,8 @@ int main(int argc, char** argv) {
                     for (int t = 0; t < G.S; ++t) prow[t] = pick;
                     std::vector<int> pkeep(bs.size(), 1);
                     pkeep[(size_t) pick] = G.keep;
-                    launched = stage_verifier(k).batch_launch_rows(prow, G.S, pick * PR, G.tok, G.pos, pkeep.data(), err);
+                    launched = stage_verifier(k).batch_launch_rows(prow, G.S, pick * PR, G.tok, G.pos, pkeep.data(), err,
+                                                                   pipe_refeed ? 0 : pick + 1);
                 } else {
                     launched = stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err);
                 }
