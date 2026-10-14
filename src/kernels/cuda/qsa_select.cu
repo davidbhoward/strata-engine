@@ -1209,6 +1209,217 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 }
 
 #if !defined(__HIPCC__)
+// ---- qsa_block_topk_split: block_topk_wide_kernel's selection (radix threshold over the cells' weights, ties to the
+// lowest index, cells ascending) with each query spread over SP_N CTAs, which meet through global memory between
+// launches: init, four radix passes (each CTA adds its chunk's histogram; the last CTA to finish picks the digit),
+// a count (the last CTA turns the chunks' counts into each chunk's output offset and tie budget), and the emission.
+// Scratch per query (int32): hist[4][256], state[8] = {prefix, above, done, -}, then gt/eq/sel_off/eq_off[SP_N].
+constexpr int SP_N = kTopkSplitCtas;
+constexpr int SP_T = 256;
+constexpr int SP_Q = 4 * 256 + 8 + 4 * SP_N;   // = qsa_block_topk_split_scratch(1)
+
+struct SplitQuery {
+    int64_t n_kv, n_bid, width, nb, lo, hi;
+    __device__ int weight(int64_t b) const { return b < n_bid ? R : (int) (n_kv - n_bid * R); }
+};
+__device__ __forceinline__ SplitQuery split_query(const int32_t* steps, int64_t qi, int chunk) {
+    const int32_t* st = steps + qi * kStepCount;
+    SplitQuery q;
+    q.n_kv = st[kStepNKv];
+    q.n_bid = st[kStepNBid];
+    q.width = st[kStepWidth];
+    q.nb = q.n_bid + 1;
+    const int64_t span = (q.nb + SP_N - 1) / SP_N;
+    q.lo = (int64_t) chunk * span < q.nb ? (int64_t) chunk * span : q.nb;
+    q.hi = q.lo + span < q.nb ? q.lo + span : q.nb;
+    return q;
+}
+
+__global__ void __launch_bounds__(SP_T) topk_split_init_kernel(int32_t* __restrict__ scratch) {
+    int32_t* w = scratch + (int64_t) blockIdx.x * SP_Q;
+    for (int i = threadIdx.x; i < 4 * 256 + 8; i += SP_T) w[i] = 0;
+}
+
+__global__ void __launch_bounds__(SP_T) topk_split_pass_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int32_t* __restrict__ scratch, int pass) {
+    __shared__ int hist[256];
+    __shared__ bool last;
+    const int64_t qi = blockIdx.y;
+    const SplitQuery q = split_query(steps, qi, blockIdx.x);
+    if (q.n_kv <= q.width) return;
+    int32_t* w = scratch + qi * SP_Q;
+    int32_t* gh = w + pass * 256;
+    volatile int32_t* state = w + 4 * 256;
+    const int shift = 24 - 8 * pass;
+    const uint32_t prefix = (uint32_t) state[0];
+    const uint32_t hmask = pass == 0 ? 0u : (0xffffffffu << (shift + 8));
+    for (int i = threadIdx.x; i < 256; i += SP_T) hist[i] = 0;
+    __syncthreads();
+    const float* sc = scores + qi * max_blocks;
+    for (int64_t b = q.lo + threadIdx.x; b < q.hi; b += SP_T) {
+        const int wt = q.weight(b);
+        if (wt == 0) continue;
+        const uint32_t k = order_key(sc[b]);
+        if ((k & hmask) == (prefix & hmask)) atomicAdd(&hist[(k >> shift) & 255], wt);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += SP_T)
+        if (hist[i] != 0) atomicAdd(&gh[i], hist[i]);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&w[4 * 256 + 2], 1) == SP_N - 1;
+    __syncthreads();
+    if (!last || threadIdx.x != 0) return;
+    __threadfence();
+    // the digit holding the need-th cell from the top, as block_topk_wide_kernel's thread 0 picks it
+    volatile int32_t* vh = gh;
+    int cum = state[1], d = 255;
+    for (; d > 0; --d) {
+        if (cum + vh[d] >= q.width) break;
+        cum += vh[d];
+    }
+    state[0] = (int32_t) (prefix | ((uint32_t) d << shift));
+    state[1] = cum;
+    state[2] = 0;
+}
+
+__global__ void __launch_bounds__(SP_T) topk_split_count_kernel(const float* __restrict__ scores,
+                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                                int32_t* __restrict__ scratch) {
+    __shared__ int s_gt[SP_T / 32], s_eq[SP_T / 32];
+    __shared__ bool last;
+    const int64_t qi = blockIdx.y;
+    const int c = blockIdx.x;
+    const SplitQuery q = split_query(steps, qi, c);
+    if (q.n_kv <= q.width) return;
+    int32_t* w = scratch + qi * SP_Q;
+    volatile int32_t* state = w + 4 * 256;
+    int32_t* cgt = w + 4 * 256 + 8;
+    int32_t* ceq = cgt + SP_N;
+    int32_t* csel = ceq + SP_N;
+    int32_t* ceo = csel + SP_N;
+    const uint32_t thr = (uint32_t) state[0];
+    const float* sc = scores + qi * max_blocks;
+    int gt = 0, eq = 0;
+    for (int64_t b = q.lo + threadIdx.x; b < q.hi; b += SP_T) {
+        const int wt = q.weight(b);
+        if (wt == 0) continue;
+        const uint32_t k = order_key(sc[b]);
+        if (k > thr) gt += wt;
+        else if (k == thr) eq += wt;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gt += __shfl_xor_sync(0xffffffffu, gt, o);
+        eq += __shfl_xor_sync(0xffffffffu, eq, o);
+    }
+    if ((threadIdx.x & 31) == 0) { s_gt[threadIdx.x >> 5] = gt; s_eq[threadIdx.x >> 5] = eq; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int a = 0, e = 0;
+        for (int i = 0; i < SP_T / 32; ++i) { a += s_gt[i]; e += s_eq[i]; }
+        cgt[c] = a;
+        ceq[c] = e;
+        __threadfence();
+        last = atomicAdd(&w[4 * 256 + 2], 1) == SP_N - 1;
+    }
+    __syncthreads();
+    if (!last || threadIdx.x != 0) return;
+    __threadfence();
+    // per chunk, in order: where its selected cells start, and the tied cells before it (block_topk_wide_kernel's
+    // per-warp loop with chunks for warps)
+    const int eq_budget = (int) (q.width - state[1]);
+    volatile int32_t* vgt = cgt;
+    volatile int32_t* veq = ceq;
+    int eb = 0, sb = 0;
+    for (int i = 0; i < SP_N; ++i) {
+        const int g2 = vgt[i], e2 = veq[i];
+        const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+        csel[i] = sb;
+        ceo[i] = eb;
+        sb += g2 + take;
+        eb += e2;
+    }
+    state[2] = 0;
+}
+
+// one warp per chunk: rows of 32 blocks in ascending order, as block_topk_wide_kernel emits a warp's rows
+__global__ void __launch_bounds__(32) topk_split_emit_kernel(const float* __restrict__ scores,
+                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                             int64_t cap, int32_t* __restrict__ ids,
+                                                             const int32_t* __restrict__ scratch) {
+    const int64_t qi = blockIdx.y;
+    const int c = blockIdx.x;
+    const int lane = threadIdx.x;
+    const SplitQuery q = split_query(steps, qi, c);
+    int32_t* out = ids + qi * cap;
+    if (q.n_kv <= q.width) {   // the identity, split over the chunks
+        const int64_t span = (q.n_kv + SP_N - 1) / SP_N;
+        const int64_t a = (int64_t) c * span, z = a + span < q.n_kv ? a + span : q.n_kv;
+        for (int64_t j = a + lane; j < z; j += 32) out[j] = (int32_t) j;
+        return;
+    }
+    const int32_t* w = scratch + qi * SP_Q;
+    const int32_t* state = w + 4 * 256;
+    const int32_t* csel = w + 4 * 256 + 8 + 2 * SP_N;
+    const int32_t* ceo = csel + SP_N;
+    const uint32_t thr = (uint32_t) state[0];
+    const int eq_budget = (int) (q.width - state[1]);
+    const float* sc = scores + qi * max_blocks;
+    int run_sel = csel[c], run_eq = ceo[c];
+    for (int64_t r0 = q.lo; r0 < q.hi; r0 += 32) {
+        const int64_t b = r0 + lane;
+        const int wt = b < q.hi ? q.weight(b) : 0;
+        const uint32_t k = wt ? order_key(sc[b]) : 0u;
+        const int my_gt = (wt && k > thr) ? wt : 0, my_eq = (wt && k == thr) ? wt : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) continue;
+        int pe = my_eq;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int cc = 0; cc < my_sel; ++cc) dst[cc] = (int32_t) (b * R + cc);
+        run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        run_sel += __shfl_sync(0xffffffffu, ps, 31);
+    }
+}
+#endif
+
+bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                          const QsaShapes& s, int32_t* ids, int32_t* scratch, void* stream) {
+#if defined(__HIPCC__)
+    (void) scores; (void) steps; (void) nq; (void) max_blocks; (void) cap; (void) s; (void) ids; (void) scratch; (void) stream;
+    return false;
+#else
+    if (nq <= 0) return true;
+    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || scratch == nullptr) return false;
+    static_assert(SP_Q == 4 * 256 + 8 + 4 * kTopkSplitCtas, "the scratch layout and qsa_block_topk_split_scratch agree");
+    cudaStream_t cs = (cudaStream_t) stream;
+    topk_split_init_kernel<<<(unsigned) nq, SP_T, 0, cs>>>(scratch);
+    const dim3 grid((unsigned) SP_N, (unsigned) nq);
+    for (int pass = 0; pass < 4; ++pass)
+        topk_split_pass_kernel<<<grid, SP_T, 0, cs>>>(scores, steps, max_blocks, scratch, pass);
+    topk_split_count_kernel<<<grid, SP_T, 0, cs>>>(scores, steps, max_blocks, scratch);
+    topk_split_emit_kernel<<<grid, 32, 0, cs>>>(scores, steps, max_blocks, cap, ids, scratch);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk_split: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+#endif
+}
+
+#if !defined(__HIPCC__)
 // Only Turing has a retained model measurement for this CUDA dispatch. Other CUDA devices keep the capacity rule
 // (the RTX 5070 regression below). Cache the properties per calling thread; layer-split device switches are checked.
 static bool topk_active_turing_device() {

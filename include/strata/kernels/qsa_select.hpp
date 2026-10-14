@@ -50,6 +50,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 /// build below sm_90, or a capacity whose keys do not fit one cluster's shared memory. Capturable.
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream);
+/// The same ids with each query spread over kTopkSplitCtas CTAs, without thread-block clusters (any CUDA card; for the
+/// decode windows on cards below sm_90, where qsa_block_topk runs one CTA per query - 3 or 4 CTAs for a whole GPU at a
+/// long context).  Seven launches through `scratch` (qsa_block_topk_split_scratch(nq) int32s of device memory, owned by
+/// the caller and not shared with a concurrent call).  Capturable.  CUDA only: false (nothing launched) on HIP.
+inline constexpr int kTopkSplitCtas = 16;
+inline int64_t qsa_block_topk_split_scratch(int64_t nq) { return nq * (4 * 256 + 8 + 4 * kTopkSplitCtas); }
+bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                          const QsaShapes& s, int32_t* ids, int32_t* scratch, void* stream);
 /// The original kernel (256 threads, one shared histogram, keys read from memory on every radix pass), for tests and
 /// STRATA_TOPK_OLD=1: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,

@@ -884,6 +884,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(decode_cluster_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(decode_cluster_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME decode_cluster_parity COMMAND decode_cluster_parity --selftest)
+    # the decode QSA top-k spread over several CTAs without clusters (any CUDA card) vs the reference, bitwise
+    add_executable(topk_split_parity src/kernels/topk_split_parity.cpp)
+    target_include_directories(topk_split_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(topk_split_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME topk_split_parity COMMAND topk_split_parity --selftest)
   endif()
 
   add_executable(rope_parity src/kernels/rope_parity.cpp)
