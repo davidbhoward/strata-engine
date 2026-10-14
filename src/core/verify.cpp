@@ -896,8 +896,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     for (int t = 1; one_slot && t < T; ++t) one_slot = brow_[t] == brow_[0];
     // the decode windows' QSA top-k: past the one-CTA register kernel's reach (a capacity above 4 * 1024 * 33 cells) the
     // selection spread over many CTAs per query (qsa_block_topk_split, CUDA): the same ids, 2x faster at a 240K context
-    // on an RTX 3090.  STRATA_TOPK_SPLIT=0: qsa_block_topk as before.  Fixed at capture, so by the capacity
-    static const bool topk_split_env = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT"); return v == nullptr || std::atoi(v) != 0; }();
+    // on an RTX 3090 per call, but no measurable change end to end on zeus (two agents at 240K: 67 vs 69 tok/s, within the
+    // noise), so opt-in: STRATA_TOPK_SPLIT=1.  Fixed at capture, so by the capacity
+    static const bool topk_split_env = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT"); return v != nullptr && std::atoi(v) != 0; }();
     const bool topk_split = topk_split_env && max_blocks_ > (int64_t) 1024 * 33;
     auto topk = [&](const float* sc, const int32_t* st, int64_t nq, int32_t* ids) {
         if (!(topk_split && qsa_block_topk_split(sc, st, nq, max_blocks_, cap_, s, ids, topk_scr_, cs)))
