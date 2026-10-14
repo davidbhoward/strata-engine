@@ -1666,7 +1666,21 @@ class StrataEngine:
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
         def held_prefix(b):
             h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+            if not h:
+                return 0
+            if len(h) < len(prompt) and prompt[:len(h)] == h:
+                return len(h)
+            # #1906: a client's next turn sends the history back without the reply's thinking, so the slot's tokens
+            # match only up to that turn's boundary - and the engine continues from the checkpoint it took there.
+            # Such a slot holds this conversation: counted by the common start, when that is most of what it holds
+            # (a long system prompt shared with another conversation's slot is not)
+            n = min(len(h), len(prompt) - 1)
+            i, step = 0, 4096
+            while i + step <= n and h[i:i + step] == prompt[i:i + step]:
+                i += step
+            while i < n and h[i] == prompt[i]:
+                i += 1
+            return i if i * 2 >= len(h) else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
