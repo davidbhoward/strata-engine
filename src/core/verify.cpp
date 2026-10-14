@@ -668,6 +668,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+        topk_scr_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_block_topk_split_scratch((int64_t) T));
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -893,6 +894,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     static const bool one_slot_env = [] { const char* v = std::getenv("STRATA_ONE_SLOT_BATCHED"); return v == nullptr || std::atoi(v) != 0; }();
     bool one_slot = batch_rec_ && one_slot_env && T > 1;
     for (int t = 1; one_slot && t < T; ++t) one_slot = brow_[t] == brow_[0];
+    // the decode windows' QSA top-k: past the one-CTA register kernel's reach (a capacity above 4 * 1024 * 33 cells) the
+    // selection spread over many CTAs per query (qsa_block_topk_split, CUDA): the same ids, 2x faster at a 240K context
+    // on an RTX 3090.  STRATA_TOPK_SPLIT=0: qsa_block_topk as before.  Fixed at capture, so by the capacity
+    static const bool topk_split_env = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool topk_split = topk_split_env && max_blocks_ > (int64_t) 1024 * 33;
+    auto topk = [&](const float* sc, const int32_t* st, int64_t nq, int32_t* ids) {
+        if (!(topk_split && qsa_block_topk_split(sc, st, nq, max_blocks_, cap_, s, ids, topk_scr_, cs)))
+            qsa_block_topk(sc, st, nq, max_blocks_, cap_, s, ids, cs);
+    };
 
     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
@@ -1383,8 +1393,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
-                                       sel_ + (size_t) t * cap_, cs);
+                        topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, sel_ + (size_t) t * cap_);
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
@@ -1394,8 +1403,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } else {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
+                topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, sel_ + (size_t) tb * cap_);
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
