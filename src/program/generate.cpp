@@ -9727,8 +9727,10 @@ int main(int argc, char** argv) {
             std::string err;
             cudaEvent_t rows_in = nullptr;   // the residual rows are in the drafter's buffer
         };
-        bool pd_async = pdraft;
-        { const char* sd = std::getenv("STRATA_PIPE_MTP_SYNC_DRAFT"); if (sd != nullptr && sd[0] != '\0' && sd[0] != '0') pd_async = false; }
+        // (measured on zeus: no faster than the round on this thread - the stages are busy 97% of the time either way - so
+        // opt-in: STRATA_PIPE_MTP_ASYNC_DRAFT=1)
+        bool pd_async = false;
+        { const char* sd = std::getenv("STRATA_PIPE_MTP_ASYNC_DRAFT"); pd_async = pdraft && sd != nullptr && sd[0] != '\0' && sd[0] != '0'; }
         std::vector<std::unique_ptr<PDraftJob>> pdj;
         struct PDraftJoin {
             std::vector<std::unique_ptr<PDraftJob>>& jobs;
