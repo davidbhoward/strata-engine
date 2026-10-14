@@ -9697,6 +9697,8 @@ int main(int argc, char** argv) {
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
+        std::vector<double> stage_busy((size_t) n_pipe, 0.0);   // ms each stage had a window in flight (the timing line)
+        std::vector<Clock::time_point> stage_t0((size_t) n_pipe);
         int64_t pipe_tick = 0, rr = 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -9926,6 +9928,7 @@ int main(int argc, char** argv) {
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 stage_group[(size_t) k] = -1;
+                stage_busy[(size_t) k] += std::chrono::duration<double, std::milli>(Clock::now() - stage_t0[(size_t) k]).count();
                 PGroup& G = pg[(size_t) gi];
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
@@ -10043,6 +10046,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
+                stage_t0[(size_t) k] = Clock::now();
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
@@ -10060,6 +10064,16 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch (pipelined): %.2f ms of wall time per group-step; on the host, CPU "
                                          "experts %.2f ms (all stages) and slot drafts %.2f ms per group-step\n",
                                  wall / w, pool / w, pd_draft_ms / w);
+                    std::string busy;
+                    for (int k = 0; k < n_pipe; ++k) {
+                        char sb[64];
+                        std::snprintf(sb, sizeof sb, "%sstage %d %.2f ms (%.0f%%)", k == 0 ? "" : ", ", k + 1, stage_busy[(size_t) k] / w,
+                                      100.0 * stage_busy[(size_t) k] / std::max(wall, 1e-9));
+                        busy += sb;
+                        stage_busy[(size_t) k] = 0;
+                    }
+                    std::fprintf(stderr, "strata batch (pipelined): a window in flight per group-step: %s
+", busy.c_str());
                     pd_draft_ms = 0;
                 }
                 if (pdraft && pd_windows > 0)
