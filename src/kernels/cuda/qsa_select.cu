@@ -1244,6 +1244,7 @@ __global__ void __launch_bounds__(SP_T) topk_split_pass_kernel(const float* __re
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int32_t* __restrict__ scratch, int pass) {
     __shared__ int hist[256];
+    __shared__ int tot[256];
     __shared__ bool last;
     const int64_t qi = blockIdx.y;
     const SplitQuery q = split_query(steps, qi, blockIdx.x);
@@ -1270,14 +1271,19 @@ __global__ void __launch_bounds__(SP_T) topk_split_pass_kernel(const float* __re
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&w[4 * 256 + 2], 1) == SP_N - 1;
     __syncthreads();
-    if (!last || threadIdx.x != 0) return;
+    if (!last) return;
     __threadfence();
+    {   // the totals into shared memory by every thread at once (one thread reading 256 of them is 256 L2 round trips)
+        volatile int32_t* vh = gh;
+        for (int i = threadIdx.x; i < 256; i += SP_T) tot[i] = vh[i];
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
     // the digit holding the need-th cell from the top, as block_topk_wide_kernel's thread 0 picks it
-    volatile int32_t* vh = gh;
     int cum = state[1], d = 255;
     for (; d > 0; --d) {
-        if (cum + vh[d] >= q.width) break;
-        cum += vh[d];
+        if (cum + tot[d] >= q.width) break;
+        cum += tot[d];
     }
     state[0] = (int32_t) (prefix | ((uint32_t) d << shift));
     state[1] = cum;
@@ -1288,6 +1294,7 @@ __global__ void __launch_bounds__(SP_T) topk_split_count_kernel(const float* __r
                                                                 const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                 int32_t* __restrict__ scratch) {
     __shared__ int s_gt[SP_T / 32], s_eq[SP_T / 32];
+    __shared__ int a_gt[SP_N], a_eq[SP_N];
     __shared__ bool last;
     const int64_t qi = blockIdx.y;
     const int c = blockIdx.x;
@@ -1325,16 +1332,21 @@ __global__ void __launch_bounds__(SP_T) topk_split_count_kernel(const float* __r
         last = atomicAdd(&w[4 * 256 + 2], 1) == SP_N - 1;
     }
     __syncthreads();
-    if (!last || threadIdx.x != 0) return;
+    if (!last) return;
     __threadfence();
+    {
+        volatile int32_t* vgt = cgt;
+        volatile int32_t* veq = ceq;
+        for (int i = threadIdx.x; i < SP_N; i += SP_T) { a_gt[i] = vgt[i]; a_eq[i] = veq[i]; }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
     // per chunk, in order: where its selected cells start, and the tied cells before it (block_topk_wide_kernel's
     // per-warp loop with chunks for warps)
     const int eq_budget = (int) (q.width - state[1]);
-    volatile int32_t* vgt = cgt;
-    volatile int32_t* veq = ceq;
     int eb = 0, sb = 0;
     for (int i = 0; i < SP_N; ++i) {
-        const int g2 = vgt[i], e2 = veq[i];
+        const int g2 = a_gt[i], e2 = a_eq[i];
         const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
         csel[i] = sb;
         ceo[i] = eb;

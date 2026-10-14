@@ -54,7 +54,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 /// decode windows on cards below sm_90, where qsa_block_topk runs one CTA per query - 3 or 4 CTAs for a whole GPU at a
 /// long context).  Seven launches through `scratch` (qsa_block_topk_split_scratch(nq) int32s of device memory, owned by
 /// the caller and not shared with a concurrent call).  Capturable.  CUDA only: false (nothing launched) on HIP.
-inline constexpr int kTopkSplitCtas = 16;
+inline constexpr int kTopkSplitCtas = 64;
 inline int64_t qsa_block_topk_split_scratch(int64_t nq) { return nq * (4 * 256 + 8 + 4 * kTopkSplitCtas); }
 bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                           const QsaShapes& s, int32_t* ids, int32_t* scratch, void* stream);
