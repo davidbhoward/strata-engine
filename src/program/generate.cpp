@@ -9707,6 +9707,99 @@ int main(int argc, char** argv) {
         // every row up to j was one: the kept rows, then each proposal the row before it picked.
         int64_t pd_windows = 0, pd_rows = 0, pd_proposed = 0, pd_accepted = 0;
         double pd_draft_ms = 0, pd_pool0 = 0;   // the host's time in the slot drafts; the stages' pool time when timing began
+        // A slot's draft round runs on a thread of its own (STRATA_PIPE_MTP_SYNC_DRAFT=1: on this one, as the first
+        // version did): the round is a wait of 0.7 ms per proposal, and this thread serves both stages' windows.  The
+        // slot's next window starts when its round is in; the PLE rows that window needs are prefetched from here.
+        struct PDraftJob {
+            std::thread th;
+            std::mutex mu;
+            std::condition_variable cv;
+            bool go = false, quit = false;
+            std::atomic<int> state{0};   // 0 idle, 1 running, 2 done, 3 failed
+            int A = 0, nd = 0;
+            int64_t pos0 = 0;
+            int32_t toks[strata::kernels::kVerifyMaxT] = {};
+            int32_t drafts[strata::kernels::kVerifyMaxT] = {};
+            float prob[strata::kernels::kVerifyMaxT] = {};
+            double ms = 0;
+            std::string err;
+            cudaEvent_t rows_in = nullptr;   // the residual rows are in the drafter's buffer
+        };
+        bool pd_async = pdraft;
+        { const char* sd = std::getenv("STRATA_PIPE_MTP_SYNC_DRAFT"); if (sd != nullptr && sd[0] != '\0' && sd[0] != '0') pd_async = false; }
+        std::vector<std::unique_ptr<PDraftJob>> pdj;
+        struct PDraftJoin {
+            std::vector<std::unique_ptr<PDraftJob>>& jobs;
+            ~PDraftJoin() {
+                for (auto& j : jobs) {
+                    { std::lock_guard<std::mutex> lk(j->mu); j->quit = true; }
+                    j->cv.notify_all();
+                    if (j->th.joinable()) j->th.join();
+                }
+            }
+        } pd_join{pdj};
+        if (pd_async) {
+            const strata::core::OnDevice on_slot_mtp(mtp.device());
+            for (int b = 0; b < o.batch; ++b) {
+                auto j = std::make_unique<PDraftJob>();
+                if (cudaEventCreateWithFlags(&j->rows_in, cudaEventDisableTiming) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: STRATA_PIPE_MTP: the draft thread's event failed\n");
+                    return 1;
+                }
+                slot_mtp[(size_t) b]->set_ple_prefetch(false);
+                PDraftJob* J = j.get();
+                strata::core::MtpDrafter* D = slot_mtp[(size_t) b].get();
+                const float min_p = pipe_min_p;
+                j->th = std::thread([J, D, min_p] {
+                    for (;;) {
+                        {
+                            std::unique_lock<std::mutex> lk(J->mu);
+                            J->cv.wait(lk, [J] { return J->go || J->quit; });
+                            if (J->quit) return;
+                            J->go = false;
+                        }
+                        const Clock::time_point t0 = Clock::now();
+                        int nd = 0;
+                        const bool ok = D->draft(J->A, J->toks, J->pos0, J->A - 1, J->drafts, J->err, J->prob, min_p, &nd);
+                        J->nd = nd;
+                        J->ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                        J->state.store(ok ? 2 : 3);
+                    }
+                });
+                pdj.push_back(std::move(j));
+            }
+        }
+        // the rounds that are in: the slot's proposals, and the PLE rows its next window gathers
+        auto pdraft_harvest = [&]() -> bool {
+            for (size_t b = 0; b < pdj.size(); ++b) {
+                PDraftJob& J = *pdj[b];
+                const int st = J.state.load();
+                if (st == 3) { std::printf("ERR batch MTP slot %d: %s\n", (int) b, J.err.c_str()); return false; }
+                if (st != 2) continue;
+                BSlot& sl = bs[b];
+                int nd = J.nd;
+                if (pipe_min_p > 0.0f && nd > 0 && J.prob[0] < pipe_min_p) nd = 0;
+                for (int j = 0; j < nd; ++j) sl.draft[(size_t) j] = J.drafts[j];
+                sl.n_draft = nd;
+                sl.draft_ready = true;
+                pd_draft_ms += J.ms;
+                J.state.store(0);
+                strata::core::SessionState* ps = bslot_ss[0][b].get();
+                if (sl.active && ps->ple.ready() && ps->ple.table != nullptr) {
+                    int32_t prev[2] = {ps->ple_prev[0], ps->ple_prev[1]};
+                    for (int j = -1; j < nd; ++j) {
+                        const int32_t t = j < 0 ? sl.x : sl.draft[(size_t) j];
+                        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                        strata::kernels::ngram_rows(&t, prev, 1, ps->ple.consts, rows16);
+                        prev[0] = prev[1];
+                        prev[1] = t;
+                        ps->ple.table->prefetch_rows(rows16);
+                    }
+                }
+            }
+            return true;
+        };
+        auto pdraft_running = [&] { for (auto& j : pdj) if (j->state.load() == 1) return true; return false; };
         auto pdraft_done = [&](int gi, strata::core::Verifier& vk) -> bool {
             PGroup& G = pg[(size_t) gi];
             BSlot& sl = bs[(size_t) gi];
@@ -9777,6 +9870,28 @@ int main(int argc, char** argv) {
             // before the last stage starts its next window, which writes those rows
             const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) gi]->device());
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+            if (pd_async) {
+                // the rows are copied on the last stage's own stream, so before its next window writes them, and the
+                // drafter's stream waits for that copy: no host wait on either
+                PDraftJob& J = *pdj[(size_t) gi];
+                if (cudaMemcpyAsync(slot_mtp_rows[(size_t) gi].get(), vk.final_R_all(), (size_t) A * stride * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, vk.stream()) != cudaSuccess ||
+                    cudaEventRecord(J.rows_in, vk.stream()) != cudaSuccess ||
+                    cudaStreamWaitEvent(slot_mtp[(size_t) gi]->stream(), J.rows_in, 0) != cudaSuccess) {
+                    std::printf("ERR batch MTP slot %d: staging the residual rows failed\n", gi);
+                    return false;
+                }
+                (void) cudaStreamQuery(vk.stream());
+                J.A = A;
+                J.pos0 = G.pos[0];
+                for (int j = 0; j < A; ++j) J.toks[j] = outb[j];
+                sl.draft_ready = false;
+                sl.n_draft = 0;
+                J.state.store(1);
+                { std::lock_guard<std::mutex> lk(J.mu); J.go = true; }
+                J.cv.notify_one();
+                return true;
+            }
             int nd = 0;
             float dprob[strata::kernels::kVerifyMaxT] = {};
             const Clock::time_point td0 = Clock::now();
@@ -9802,6 +9917,7 @@ int main(int argc, char** argv) {
                 pd_pool0 = 0;
                 for (int k = 0; k < n_pipe; ++k) pd_pool0 += stage_verifier(k).ms_pool;
             }
+            if (pd_async && !pdraft_harvest()) return false;
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
@@ -9875,7 +9991,9 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                        if (!pg[(size_t) gi].inflight && group_active(gi) &&
+                            !(pd_async && pdj[(size_t) gi]->state.load() != 0))
+                            pick = gi;
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
@@ -9956,9 +10074,9 @@ int main(int argc, char** argv) {
             return true;
         };
         auto pipe_drain = [&]() -> bool {
-            while (pipe_inflight())
+            while (pipe_inflight() || pdraft_running())
                 if (!pump(false)) return false;
-            return true;
+            return !pd_async || pdraft_harvest();
         };
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {

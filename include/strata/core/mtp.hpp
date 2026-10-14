@@ -112,6 +112,9 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
+    /// draft() on a thread of its own (the pipelined slot drafts): it then leaves the PLE table alone - the table's
+    /// reader is the main thread's, which prefetches the rows of the next window itself.
+    void set_ple_prefetch(bool on) { ple_prefetch_ = on; }
     bool coupled() const { return coupled_active_; }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
     /// q and each draft j's distribution is in spec_q() + j * kSpecQStride (ids, -1 terminated; then float bits),
@@ -193,6 +196,7 @@ private:
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
     SessionState* ple_ss_ = nullptr;
+    bool ple_prefetch_ = true;
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
