@@ -10072,8 +10072,7 @@ int main(int argc, char** argv) {
                         busy += sb;
                         stage_busy[(size_t) k] = 0;
                     }
-                    std::fprintf(stderr, "strata batch (pipelined): a window in flight per group-step: %s
-", busy.c_str());
+                    std::fprintf(stderr, "strata batch (pipelined): a window in flight per group-step: %s\n", busy.c_str());
                     pd_draft_ms = 0;
                 }
                 if (pdraft && pd_windows > 0)
