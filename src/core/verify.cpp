@@ -887,6 +887,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
+    // a batch window whose rows are all one slot's (the pipelined slot drafts: its token and its proposals) is one
+    // sequence, as a solo window is: its K/V appends, indexer appends and attention take the solo path's batched
+    // launches over the slot's own state instead of one launch per row (STRATA_ONE_SLOT_BATCHED=0: per row)
+    static const bool one_slot_env = [] { const char* v = std::getenv("STRATA_ONE_SLOT_BATCHED"); return v == nullptr || std::atoi(v) != 0; }();
+    bool one_slot = batch_rec_ && one_slot_env && T > 1;
+    for (int t = 1; one_slot && t < T; ++t) one_slot = brow_[t] == brow_[0];
 
     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
@@ -1189,7 +1195,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
-                const QsaState& st = ss.qsa_states[qi];
+                // (a batch window reads only st's layout from it - every slot session is carved alike - except a
+                // one-slot window, whose batched launches below use it as the slot's own state)
+                const QsaState& st = batch_rec_ ? slot_ss(0).qsa_states[qi] : ss.qsa_states[qi];
                 const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
                                 *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
                                 *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
@@ -1268,7 +1276,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                if (dec_batch && !g_no_batch_kv && (!batch_rec_ || one_slot)) {
                     const int32_t* step_b = step_ + tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
                     const float* vc_b = vcur_ + tb * NKV * HD;
@@ -1313,7 +1321,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                if (dec_batch && !g_no_batch_kv && (!batch_rec_ || one_slot)) {
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
                                                     n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
@@ -1370,7 +1378,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 stamp(l, 10, grp);
-                if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                if (batch_rec_ && !one_slot) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
