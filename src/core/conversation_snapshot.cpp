@@ -226,6 +226,37 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return false;
 }
 
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto, bool index,
+                          std::string& error) {
+    Layout lf{}, lt{};
+    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error)) return false;
+    if (!layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
+    if (lf.format != lt.format || lf.cells != lt.cells || lf.page_size != lt.page_size || lf.pooled_rows != lt.pooled_rows ||
+        lf.data != lt.data || lf.value_data != lt.value_data || lf.scales != lt.scales ||
+        lf.value_scales != lt.value_scales || lf.pooled != lt.pooled) {
+        error = "conversation K/V copy: the two states are not carved alike";
+        return false;
+    }
+    const auto src = pools(from);
+    const auto dst = pools(to);
+    const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !transfer(dst[i], src[i], sizes[i], error)) return false;
+    // the same residency steps as a restore: the target's VRAM slots still hold its outgoing conversation
+    if (to.kv_mode == 1) strata::kernels::kv_stream_reset(to.map, nullptr);
+    if (to.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(to), to.host, qsa_kv_format(to),
+                                        std::max<int64_t>(0, end - to.n_slots), end, to.n_slots, shapes, nullptr);
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation K/V copy residency restore: ") + cudaGetErrorString(status);
+    return false;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
