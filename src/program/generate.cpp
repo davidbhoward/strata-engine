@@ -1003,6 +1003,12 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
+/// STRATA_PIPE_SOLO=1: --pipeline-windows beside --batch slots (a request alone decodes in the pipelined windows)
+static bool pipe_solo_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PIPE_SOLO"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
@@ -3421,7 +3427,9 @@ int main(int argc, char** argv) {
                         : split_devs.size() > 1 && o.pipeline_windows == 1 ? "--pipeline-windows 1 needs exactly two stages"
                         : split_devs.size() > 1 && o.adapt_async ? "not with --adapt-async on three or more stages"
                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
-                        : o.batch != 0 ? "not with --batch slots"
+                        // STRATA_PIPE_SOLO=1: beside the slots too - a request alone takes the pipelined solo windows
+                        // (the second verifier per stage), the slots keep the first; they never run at the same time
+                        : o.batch != 0 && !pipe_solo_env() ? "not with --batch slots"
                         : o.peer_device >= 1 ? "not with --peer-device"
                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
                         : nullptr;
