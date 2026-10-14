@@ -9595,7 +9595,7 @@ int main(int argc, char** argv) {
                                         2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
                                         slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
                         !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
+                                                    sl.draft.data(), err, nullptr, 0.0f, &sl.n_draft)) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }
@@ -11289,7 +11289,13 @@ int main(int argc, char** argv) {
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
-                const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
+                // STRATA_PIPE_READ_SHARE=1 (with STRATA_PIPE_MTP): the pipelined groups, too, read a prompt a chunk at a
+                // time beside decoding slots, which take their serial windows between the chunks (STRATA_BATCH_DECODE_SHARE
+                // of the read's time, 0.5 by default) instead of waiting for the whole read
+                static const bool pipe_read_share = [] { const char* v = std::getenv("STRATA_PIPE_READ_SHARE"); return v != nullptr && std::atoi(v) != 0; }();
+                const int64_t piece = pdraft && pipe_read_share && batch_on()
+                                    ? C
+                                    : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
